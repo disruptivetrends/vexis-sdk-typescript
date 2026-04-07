@@ -1,7 +1,7 @@
 {
   "name": "@vexis/sdk",
-  "version": "0.4.0",
-  "description": "Official TypeScript/JavaScript SDK for the VEXIS AI Governance Platform",
+  "version": "0.5.0",
+  "description": "Official TypeScript/JavaScript SDK for the VEXIS AI Governance Platform — guardrails, audit trails, blockchain attestation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -21,12 +21,29 @@
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["ai-governance", "guardrails", "llm-security", "eu-ai-act", "compliance", "vexis"],
+  "keywords": [
+    "ai-governance",
+    "guardrails",
+    "llm-security",
+    "eu-ai-act",
+    "compliance",
+    "vexis",
+    "ai-safety",
+    "pii-detection",
+    "audit-trail",
+    "blockchain-attestation",
+    "mcp",
+    "agentic-ai"
+  ],
   "author": "VEXIS <sdk@vexis.io>",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vexis-security/vexis-sdk-typescript"
+    "url": "https://github.com/disruptivetrends/vexis-sdk-typescript"
+  },
+  "homepage": "https://docs.vexis.io/sdk/typescript",
+  "bugs": {
+    "url": "https://github.com/disruptivetrends/vexis-sdk-typescript/issues"
   },
   "engines": {
     "node": ">=18"

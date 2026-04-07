@@ -242,7 +242,7 @@ const DEFAULT_BASE_URL = 'https://gateway.vexis.io';
 const DEFAULT_TIMEOUT = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY = 500;
-const SDK_VERSION = '0.4.0';
+const SDK_VERSION = '0.5.0';
 
 export class Vexis {
   private readonly config: Required<Pick<VexisConfig,

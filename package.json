@@ -1,5 +1,5 @@
 {
-  "name": "@vexis/sdk",
+  "name": "@vexis-security/sdk",
   "version": "0.5.0",
   "description": "Official TypeScript/JavaScript SDK for the VEXIS AI Governance Platform — guardrails, audit trails, blockchain attestation",
   "main": "dist/index.js",

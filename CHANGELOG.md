@@ -4,6 +4,41 @@ All notable changes to `@palveron/sdk` will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-05-19
+
+### Changed
+- `verify()` now treats the gateway's Sprint-87 HTTP semantics as governance
+  decisions rather than errors. The mapping is:
+  - `200 OK` → `decision: 'PASSED' | 'MODIFIED' | 'FLAGGED' | 'POLICY_CHANGE'`
+  - `202 Accepted` → `decision: 'PENDING_APPROVAL'`
+  - `403 Forbidden` → `decision: 'BLOCKED'`
+  - `429 Too Many Requests` → `decision: 'RATE_LIMITED'` (synthesised) with
+    `retryAfterMs` parsed from the `Retry-After` header
+- Previous behaviour: 403/429 raised `PalveronError` / `PalveronRateLimitError`.
+  New behaviour: only transport/auth/server failures (401, 5xx, network,
+  timeout) raise. Governance outcomes always flow through `decision`.
+- Non-verify endpoints (`listPolicies`, `health`) keep the strict
+  error-on-non-2xx behaviour, so 429 on read endpoints still retries with
+  exponential backoff.
+
+### Added
+- `Decision` type extended to cover all gateway decisions:
+  `PASSED`, `ALLOWED`, `BLOCKED`, `MODIFIED`, `FLAGGED`, `PENDING_APPROVAL`,
+  `POLICY_CHANGE`, `RATE_LIMITED`, `ERROR`.
+- `VerifyResponse.retryAfterMs` — populated when `decision === 'RATE_LIMITED'`.
+- `VerifyResponse.httpStatus` — the HTTP status code that produced the
+  response, useful for observability.
+- RFC-7231-compliant `Retry-After` parsing (handles both delta-seconds and
+  HTTP-date formats).
+
+### Migration
+- If you previously caught `PalveronError` to handle a block, switch to
+  branching on `result.decision === 'BLOCKED'`.
+- If you previously caught `PalveronRateLimitError`, switch to checking
+  `result.decision === 'RATE_LIMITED'` and honouring `result.retryAfterMs`.
+- Existing `try { … } catch (PalveronError)` handlers for auth/validation/
+  server errors are unchanged.
+
 ## [1.0.0] — 2026-05-17
 
 ### Added

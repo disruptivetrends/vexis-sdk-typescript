@@ -6,7 +6,31 @@
 
 // ─── Types ──────────────────────────────────────────────────
 
-export type Decision = 'ALLOWED' | 'BLOCKED' | 'MODIFIED' | 'ERROR';
+/**
+ * Governance decision returned by `/api/v1/verify`.
+ *
+ * The gateway emits `PASSED` (Sprint 73+); `ALLOWED` is preserved as an
+ * alias for older deployments. `RATE_LIMITED` is synthesised client-side
+ * when the gateway returns 429 — it lets callers branch on `decision`
+ * uniformly instead of catching an exception just for rate limits.
+ *
+ * HTTP status code mapping (Sprint 87):
+ *   PASSED / ALLOWED / MODIFIED / FLAGGED / POLICY_CHANGE → 200 OK
+ *   PENDING_APPROVAL                                      → 202 Accepted
+ *   BLOCKED                                               → 403 Forbidden
+ *   RATE_LIMITED                                          → 429 Too Many Requests
+ *   ERROR                                                 → transport/internal failure
+ */
+export type Decision =
+  | 'PASSED'
+  | 'ALLOWED'
+  | 'BLOCKED'
+  | 'MODIFIED'
+  | 'FLAGGED'
+  | 'PENDING_APPROVAL'
+  | 'POLICY_CHANGE'
+  | 'RATE_LIMITED'
+  | 'ERROR';
 export type RiskLevel = 'minimal' | 'limited' | 'high' | 'unacceptable';
 export type Sensitivity = 'low' | 'medium' | 'high';
 
@@ -105,6 +129,14 @@ export interface VerifyResponse {
   findings: Finding[];
   /** Server-side latency in milliseconds */
   latencyMs: number;
+  /**
+   * Retry hint when `decision === 'RATE_LIMITED'`. The SDK reads this
+   * from the gateway's `Retry-After` header (in seconds) and converts
+   * it to milliseconds. Honour it before issuing the next request.
+   */
+  retryAfterMs?: number;
+  /** HTTP status code that produced this response (200, 202, 403, 429). */
+  httpStatus?: number;
 }
 
 export interface PolicyListResponse {
@@ -242,7 +274,7 @@ const DEFAULT_BASE_URL = 'https://gateway.palveron.com';
 const DEFAULT_TIMEOUT = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY = 500;
-const SDK_VERSION = '1.0.0';
+const SDK_VERSION = '1.1.0';
 
 export class Palveron {
   private readonly config: Required<Pick<PalveronConfig,
@@ -305,13 +337,23 @@ export class Palveron {
     };
 
     const start = Date.now();
-    const raw = await this.request<Record<string, unknown>>('POST', '/api/v1/verify', body);
+    // expectGovernanceDecision: 202 / 403 / 429 surface as VerifyResponse,
+    // not as exceptions. This matches the gateway's Sprint 87 HTTP
+    // semantics — see /docs/api/verify for the full status-code table.
+    const { body: raw, status, retryAfterMs } = await this.request<Record<string, unknown>>(
+      'POST',
+      '/api/v1/verify',
+      body,
+      { expectGovernanceDecision: true },
+    );
     const latency = Date.now() - start;
 
+    const decision = this.coerceDecision(raw.decision, status);
+
     return {
-      decision: (raw.decision as Decision) ?? 'ERROR',
+      decision,
       output: (raw.output as string) ?? '',
-      reason: (raw.reason as string) ?? '',
+      reason: (raw.reason as string) ?? (typeof raw.error === 'string' ? raw.error : ''),
       traceId: (raw.trace_id as string) ?? '',
       integrityHash: (raw.integrity_hash as string) ?? '',
       shouldAnchor: (raw.should_anchor as boolean) ?? false,
@@ -320,7 +362,26 @@ export class Palveron {
       contentType: (raw.content_type as string) ?? 'text',
       findings: (raw.findings as Finding[]) ?? [],
       latencyMs: latency,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      httpStatus: status,
     };
+  }
+
+  /**
+   * Resolve the canonical Decision string from a raw response body and
+   * its HTTP status. Used by verify() to map 429 (no `decision` in body)
+   * onto a synthesised `RATE_LIMITED` decision without ever throwing.
+   */
+  private coerceDecision(raw: unknown, status: number): Decision {
+    if (typeof raw === 'string' && raw.length > 0) {
+      return raw as Decision;
+    }
+    // Body had no `decision` field — synthesise from HTTP status.
+    if (status === 429) return 'RATE_LIMITED';
+    if (status === 403) return 'BLOCKED';
+    if (status === 202) return 'PENDING_APPROVAL';
+    if (status >= 200 && status < 300) return 'PASSED';
+    return 'ERROR';
   }
 
   // ── Convenience: Quick verify (string-only) ─────────────
@@ -375,7 +436,8 @@ export class Palveron {
    * List all active policies for the project.
    */
   async listPolicies(env: string = 'prod'): Promise<PolicyListResponse> {
-    return this.request<PolicyListResponse>('GET', `/api/v1/policies?env=${env}`);
+    const { body } = await this.request<PolicyListResponse>('GET', `/api/v1/policies?env=${env}`);
+    return body;
   }
 
   // ── Health ──────────────────────────────────────────────
@@ -384,7 +446,8 @@ export class Palveron {
    * Check gateway health status.
    */
   async health(): Promise<HealthResponse> {
-    return this.request<HealthResponse>('GET', '/health');
+    const { body } = await this.request<HealthResponse>('GET', '/health');
+    return body;
   }
 
   // ── Diagnostics ─────────────────────────────────────────
@@ -410,11 +473,37 @@ export class Palveron {
 
   // ─── Internal: HTTP with retry + circuit breaker ────────
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  /**
+   * Issue an HTTP request with retry + circuit-breaker + timeout.
+   *
+   * Returns `{ body, status, retryAfterMs? }` so the caller can branch
+   * on the HTTP status itself when needed (verify uses this to surface
+   * 202 / 403 / 429 as governance decisions instead of exceptions).
+   *
+   * When `opts.expectGovernanceDecision` is set:
+   *   • 202 (PENDING_APPROVAL), 403 (BLOCKED) → the parsed body is
+   *     returned without retry; the caller maps `body.decision`.
+   *   • 429 (RATE_LIMITED) → the parsed body is returned **without
+   *     retry**; the caller surfaces `decision: 'RATE_LIMITED'` with
+   *     `retryAfterMs`. (Versus the default behaviour, which retries
+   *     transient 429s on idempotent reads like listPolicies/health.)
+   *   • Everything else: identical to default behaviour.
+   *
+   * Auth (401), validation (400), and 5xx remain exceptions because
+   * they are not governance decisions — they are transport/config
+   * failures and should surface as such.
+   */
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { expectGovernanceDecision?: boolean },
+  ): Promise<{ body: T; status: number; retryAfterMs?: number }> {
     if (!this.circuit.canRequest()) {
       throw new PalveronCircuitOpenError();
     }
 
+    const governed = opts?.expectGovernanceDecision === true;
     let lastError: Error | null = null;
     const maxAttempts = this.config.maxRetries + 1;
 
@@ -453,7 +542,28 @@ export class Palveron {
 
         if (response.ok) {
           this.circuit.onSuccess();
-          return await response.json() as T;
+          return {
+            body: await response.json() as T,
+            status: response.status,
+          };
+        }
+
+        // ── Governance decisions returned as non-2xx (Sprint 87) ──
+        // 202 PENDING_APPROVAL, 403 BLOCKED, 429 RATE_LIMITED all
+        // carry meaningful bodies on the verify endpoint. When the
+        // caller opts into governance semantics, surface them as
+        // results rather than exceptions.
+        if (governed && (response.status === 202 || response.status === 403 || response.status === 429)) {
+          this.circuit.onSuccess(); // governance decisions are not failures
+          const parsed = await response.json().catch(() => ({})) as T;
+          const retryAfterMs = response.status === 429
+            ? parseRetryAfter(response.headers.get('retry-after'))
+            : undefined;
+          return {
+            body: parsed,
+            status: response.status,
+            ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+          };
         }
 
         // Handle specific error codes
@@ -466,7 +576,7 @@ export class Palveron {
         }
 
         if (response.status === 429) {
-          const retryAfter = parseInt(response.headers.get('retry-after') ?? '5', 10) * 1000;
+          const retryAfter = parseRetryAfter(response.headers.get('retry-after')) ?? 5_000;
           throw new PalveronRateLimitError(
             'Rate limit exceeded',
             retryAfter,
@@ -568,6 +678,36 @@ export class Palveron {
     };
     return map[ext ?? ''] ?? 'application/octet-stream';
   }
+}
+
+// ─── Helpers ────────────────────────────────────────────
+
+/**
+ * Parse a `Retry-After` HTTP header into milliseconds.
+ *
+ * Per RFC 7231 the value can be either delta-seconds (an integer) or
+ * an HTTP-date. We support both. Returns undefined for missing /
+ * unparseable headers so the caller can decide on a default.
+ */
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+
+  // delta-seconds
+  const seconds = Number(trimmed);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+
+  // HTTP-date — Date.parse returns NaN on failure
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    const delta = dateMs - Date.now();
+    return delta > 0 ? delta : 0;
+  }
+
+  return undefined;
 }
 
 // ─── Factory ──────────────────────────────────────────────
